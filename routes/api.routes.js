@@ -29,7 +29,7 @@ const {
 } = require('../controllers/company.controller');
 
 const {
-  addMerchant, listMerchants, getMerchant, deactivateMerchant,
+  addMerchant, listMerchants, getMerchant, deactivateMerchant, rotateSecret,
 } = require('../controllers/merchant.controller');
 
 const {
@@ -45,10 +45,11 @@ router.get( '/companies/me',   auth, getCompany);
 router.post('/companies/rotate-key', auth, rotateApiKey);
 
 // ── Merchants ──────────────────────────────────────────────────────────────
-router.post(  '/merchants',      auth, addMerchant);
-router.get(   '/merchants',      auth, listMerchants);
-router.get(   '/merchants/:id',  auth, getMerchant);
-router.delete('/merchants/:id',  auth, deactivateMerchant);
+router.post(  '/merchants',                    auth, addMerchant);
+router.get(   '/merchants',                    auth, listMerchants);
+router.get(   '/merchants/:id',                auth, getMerchant);
+router.delete('/merchants/:id',                auth, deactivateMerchant);
+router.post(  '/merchants/:id/rotate-secret',  auth, rotateSecret);
 
 // ── Transactions ───────────────────────────────────────────────────────────
 router.get('/transactions',                  auth, listTransactions);

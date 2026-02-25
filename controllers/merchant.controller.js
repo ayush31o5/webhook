@@ -1,62 +1,123 @@
 /**
  * Merchant Controller
  * ───────────────────
- * Manages merchant gateway configs for a company.
  *
- * POST   /api/merchants                  → Add a merchant config, get callback URL
- * GET    /api/merchants                  → List all merchants for this company
- * GET    /api/merchants/:id              → Get single merchant config
- * DELETE /api/merchants/:id              → Deactivate a merchant config
+ * KEY DESIGN DECISION — Who generates the webhook secret?
+ * ────────────────────────────────────────────────────────
  *
- * All routes require auth (Bearer API key).
+ * It depends on the gateway:
+ *
+ * ┌──────────────┬────────────────────────────────────────────────────────┐
+ * │ Gateway      │ Who sets the secret & flow                             │
+ * ├──────────────┼────────────────────────────────────────────────────────┤
+ * │ Razorpay     │ WE generate webhookSecret.                             │
+ * │              │ Company pastes it in Razorpay Dashboard when adding   │
+ * │              │ the webhook URL. Shown ONCE in our API response.       │
+ * ├──────────────┼────────────────────────────────────────────────────────┤
+ * │ Cashfree     │ Company provides their API clientSecret from           │
+ * │              │ Cashfree Dashboard (Developers → API Keys).            │
+ * │              │ Cashfree signs webhooks using this same key.           │
+ * ├──────────────┼────────────────────────────────────────────────────────┤
+ * │ PayU         │ Company provides their salt from PayU Dashboard.       │
+ * │              │ PayU uses this salt in reverse-hash verification.      │
+ * ├──────────────┼────────────────────────────────────────────────────────┤
+ * │ PhonePe      │ Company provides saltKey + saltIndex from              │
+ * │              │ PhonePe Business Dashboard → API Configuration.        │
+ * ├──────────────┼────────────────────────────────────────────────────────┤
+ * │ CCAvenue     │ Company provides workingKey (+ optional accessCode)    │
+ * │              │ from CCAvenue Dashboard → Account → My Profile.        │
+ * └──────────────┴────────────────────────────────────────────────────────┘
+ *
+ * For Razorpay: platformSecret is stored encrypted in MerchantConfig.
+ * It is shown ONCE in the POST /api/merchants response.
+ * If lost, company must call POST /api/merchants/:id/rotate-secret
+ * which generates a new one and requires updating Razorpay dashboard too.
+ *
+ * Routes:
+ *   POST   /api/merchants                       Add merchant → get callbackUrl
+ *   GET    /api/merchants                       List all merchants
+ *   GET    /api/merchants/:id                   Get single merchant
+ *   DELETE /api/merchants/:id                   Deactivate
+ *   POST   /api/merchants/:id/rotate-secret     Regenerate Razorpay webhook secret
  */
 
+const crypto         = require('crypto');
 const MerchantConfig = require('../models/MerchantConfig');
 const { encrypt }    = require('../config/encryption');
 
-// ── Validation: required credential fields per gateway ─────────────────────
-const REQUIRED_CREDENTIALS = {
-  razorpay: ['webhookSecret'],
-  cashfree: ['clientSecret'],
-  payu:     ['salt'],
-  phonepe:  ['saltKey', 'saltIndex'],
-  ccavenue: ['workingKey'],
+const BASE_URL = process.env.BASE_URL || 'https://yourplatform.com';
+
+// ── Gateway config: what company must provide vs what we generate ──────────
+
+const GATEWAY_CONFIG = {
+  razorpay: {
+    // We generate the webhookSecret — company pastes it in Razorpay dashboard
+    companyMustProvide: [],
+    weGenerate:         ['webhookSecret'],
+    plainFields:        [],
+    note: 'We generate the webhook secret for you. Paste it in Razorpay Dashboard → Settings → Webhooks when adding the webhook URL.',
+  },
+  cashfree: {
+    // clientSecret comes from Cashfree API Keys — company must provide
+    companyMustProvide: ['clientSecret'],
+    weGenerate:         [],
+    plainFields:        [],
+    note: 'Provide your Cashfree API clientSecret from Cashfree Dashboard → Developers → API Keys.',
+  },
+  payu: {
+    // salt comes from PayU dashboard — company must provide
+    companyMustProvide: ['salt'],
+    weGenerate:         [],
+    plainFields:        [],
+    note: 'Provide your PayU salt from PayU Dashboard → Settings.',
+  },
+  phonepe: {
+    // saltKey + saltIndex from PhonePe Business Dashboard
+    companyMustProvide: ['saltKey', 'saltIndex'],
+    weGenerate:         [],
+    plainFields:        ['saltIndex'],   // saltIndex is not secret
+    note: 'Provide your saltKey and saltIndex from PhonePe Business Dashboard → API Configuration.',
+  },
+  ccavenue: {
+    // workingKey from CCAvenue dashboard
+    companyMustProvide: ['workingKey'],
+    weGenerate:         [],
+    plainFields:        [],
+    note: 'Provide your Working Key from CCAvenue Dashboard → Account → My Profile.',
+  },
 };
 
-// Fields that should NOT be encrypted (not secret)
-const PLAIN_FIELDS = new Set(['saltIndex']);
-
-const BASE_URL = process.env.BASE_URL || 'https://yourplatform.com';
+// ── Generate a platform webhook secret (for Razorpay) ─────────────────────
+function generateWebhookSecret() {
+  // 32 bytes = 64 hex chars — strong enough for HMAC-SHA256
+  return crypto.randomBytes(32).toString('hex');
+}
 
 // ── POST /api/merchants ────────────────────────────────────────────────────
 const addMerchant = async (req, res) => {
   const company = req.company;
-  const { gateway, merchantId, label, credentials } = req.body;
+  const { gateway, merchantId, label, credentials = {} } = req.body;
 
-  // ── Validate inputs ───────────────────────────────────────────────────
   if (!gateway || !merchantId) {
     return res.status(400).json({ error: 'gateway and merchantId are required' });
   }
 
-  const validGateways = ['razorpay', 'cashfree', 'payu', 'phonepe', 'ccavenue'];
-  if (!validGateways.includes(gateway.toLowerCase())) {
+  const gw = gateway.toLowerCase();
+  const gwConfig = GATEWAY_CONFIG[gw];
+
+  if (!gwConfig) {
     return res.status(400).json({
-      error: `Invalid gateway. Must be one of: ${validGateways.join(', ')}`,
+      error: `Invalid gateway. Must be one of: ${Object.keys(GATEWAY_CONFIG).join(', ')}`,
     });
   }
 
-  const gw = gateway.toLowerCase();
-
-  // ── Check required credentials ────────────────────────────────────────
-  const required = REQUIRED_CREDENTIALS[gw];
-  if (!credentials || typeof credentials !== 'object') {
-    return res.status(400).json({ error: 'credentials object is required' });
-  }
-
-  const missing = required.filter((k) => !credentials[k]);
+  // ── Validate company-provided credentials ─────────────────────────────
+  const missing = gwConfig.companyMustProvide.filter((k) => !credentials[k]);
   if (missing.length > 0) {
     return res.status(400).json({
-      error: `Missing credentials for ${gw}: ${missing.join(', ')}`,
+      error:    `Missing required credentials for ${gw}: ${missing.join(', ')}`,
+      required: gwConfig.companyMustProvide,
+      note:     gwConfig.note,
     });
   }
 
@@ -68,24 +129,35 @@ const addMerchant = async (req, res) => {
   });
   if (exists) {
     return res.status(409).json({
-      error: `Merchant "${merchantId}" for gateway "${gw}" already exists`,
+      error:               `Merchant "${merchantId}" for ${gw} already registered`,
       existingCallbackUrl: exists.callbackUrl,
     });
   }
 
-  // ── Encrypt credentials ───────────────────────────────────────────────
+  // ── Build credentials to store ────────────────────────────────────────
   const encryptedCredentials = {};
-  for (const [key, value] of Object.entries(credentials)) {
+
+  // 1. Company-provided fields → encrypt (unless in plainFields)
+  for (const key of gwConfig.companyMustProvide) {
+    const value = credentials[key];
     if (!value) continue;
-    encryptedCredentials[key] = PLAIN_FIELDS.has(key)
-      ? String(value)          // saltIndex → store as plain
-      : encrypt(String(value)); // everything else → AES-256-GCM
+    encryptedCredentials[key] = gwConfig.plainFields.includes(key)
+      ? String(value)
+      : encrypt(String(value));
   }
 
-  // ── Build callback URL ────────────────────────────────────────────────
+  // 2. Platform-generated fields → generate + encrypt + return to company once
+  const generatedSecrets = {};
+  for (const key of gwConfig.weGenerate) {
+    const plaintext = generateWebhookSecret();
+    encryptedCredentials[key] = encrypt(plaintext);
+    generatedSecrets[key]     = plaintext;   // returned ONCE in response
+  }
+
+  // ── Build callback URL ─────────────────────────────────────────────────
   const callbackUrl = `${BASE_URL}/webhook/${gw}/${company.slug}/${merchantId}`;
 
-  // ── Save ──────────────────────────────────────────────────────────────
+  // ── Save ───────────────────────────────────────────────────────────────
   const config = await MerchantConfig.create({
     companyId:   company._id,
     companySlug: company.slug,
@@ -96,8 +168,8 @@ const addMerchant = async (req, res) => {
     callbackUrl,
   });
 
-  return res.status(201).json({
-    message: `Merchant added. Paste the callbackUrl into your ${gw} dashboard.`,
+  // ── Build response ─────────────────────────────────────────────────────
+  const response = {
     merchant: {
       id:          config._id,
       gateway:     config.gateway,
@@ -107,21 +179,62 @@ const addMerchant = async (req, res) => {
       isActive:    config.isActive,
       createdAt:   config.createdAt,
     },
-    instructions: getInstructions(gw, callbackUrl),
+    setup: getSetupInstructions(gw, callbackUrl, generatedSecrets),
+  };
+
+  // If we generated secrets, highlight them clearly
+  if (Object.keys(generatedSecrets).length > 0) {
+    response.generatedSecrets = generatedSecrets;
+    response.warning = '⚠️  Save these secrets now — they will NOT be shown again. If lost, use /rotate-secret to regenerate (requires updating your gateway dashboard too).';
+  }
+
+  return res.status(201).json(response);
+};
+
+// ── POST /api/merchants/:id/rotate-secret ─────────────────────────────────
+// Only applicable for Razorpay (where we own the secret)
+const rotateSecret = async (req, res) => {
+  const config = await MerchantConfig
+    .findOne({ _id: req.params.id, companyId: req.company._id })
+    .select('+credentials');
+
+  if (!config) return res.status(404).json({ error: 'Merchant config not found' });
+
+  const gwConfig = GATEWAY_CONFIG[config.gateway];
+  if (!gwConfig.weGenerate.length) {
+    return res.status(400).json({
+      error: `Secret rotation is only for platform-generated secrets (Razorpay). For ${config.gateway}, update your credentials via the gateway dashboard.`,
+    });
+  }
+
+  const generatedSecrets = {};
+  for (const key of gwConfig.weGenerate) {
+    const plaintext = generateWebhookSecret();
+    config.credentials[key] = encrypt(plaintext);
+    generatedSecrets[key]   = plaintext;
+  }
+
+  config.markModified('credentials');
+  await config.save();
+
+  return res.json({
+    message:          'Secret rotated. Update your gateway dashboard immediately.',
+    generatedSecrets,
+    warning:          '⚠️  Update your Razorpay webhook secret NOW — old webhooks will fail until you do.',
+    callbackUrl:      config.callbackUrl,
   });
 };
 
 // ── GET /api/merchants ─────────────────────────────────────────────────────
 const listMerchants = async (req, res) => {
   const { gateway, isActive } = req.query;
-
   const filter = { companyId: req.company._id };
-  if (gateway)  filter.gateway  = gateway.toLowerCase();
+  if (gateway)            filter.gateway  = gateway.toLowerCase();
   if (isActive !== undefined) filter.isActive = isActive === 'true';
 
   const merchants = await MerchantConfig
     .find(filter)
-    .select('-credentials')   // never return encrypted creds in list
+    .select('-credentials')
     .sort({ createdAt: -1 })
     .lean();
 
@@ -139,7 +252,7 @@ const getMerchant = async (req, res) => {
 
   return res.json({
     ...config,
-    instructions: getInstructions(config.gateway, config.callbackUrl),
+    setup: getSetupInstructions(config.gateway, config.callbackUrl, {}),
   });
 };
 
@@ -152,40 +265,49 @@ const deactivateMerchant = async (req, res) => {
   ).select('-credentials');
 
   if (!config) return res.status(404).json({ error: 'Merchant config not found' });
-
   return res.json({ message: 'Merchant deactivated', merchantId: config.merchantId });
 };
 
-// ── Helper: per-gateway dashboard instructions ─────────────────────────────
-function getInstructions(gateway, callbackUrl) {
+// ── Setup instructions per gateway ────────────────────────────────────────
+function getSetupInstructions(gateway, callbackUrl, generatedSecrets) {
   const map = {
     razorpay: {
-      where:  'Razorpay Dashboard → Settings → Webhooks → Add New Webhook',
-      url:    callbackUrl,
-      note:   'Paste the webhookSecret you provided as the "Secret" field in the Razorpay webhook form.',
+      step1: `Go to: Razorpay Dashboard → Settings → Webhooks → Add New Webhook`,
+      step2: `Webhook URL: ${callbackUrl}`,
+      step3: generatedSecrets.webhookSecret
+        ? `Webhook Secret: ${generatedSecrets.webhookSecret}  ← paste this exactly`
+        : `Webhook Secret: [use the webhookSecret from when you registered]`,
+      step4: `Enable events: payment.captured, payment.failed, refund.created`,
     },
     cashfree: {
-      where:  'Cashfree Dashboard → Developers → Webhooks',
-      url:    callbackUrl,
-      note:   'Set PAYMENT_SUCCESS, PAYMENT_FAILED, and REFUND events.',
+      step1: `Go to: Cashfree Dashboard → Developers → Webhooks`,
+      step2: `Webhook URL: ${callbackUrl}`,
+      step3: `Enable events: PAYMENT_SUCCESS_WEBHOOK, PAYMENT_FAILED_WEBHOOK, REFUND_STATUS_WEBHOOK`,
+      note:  `Cashfree signs webhooks with your API clientSecret (already saved).`,
     },
     payu: {
-      where:  'PayU Dashboard → Developer → Webhook URL',
-      url:    callbackUrl,
-      note:   'PayU uses reverse hash — ensure the salt you provided matches your PayU dashboard salt.',
+      step1: `Go to: PayU Dashboard → Developer → Webhook URL`,
+      step2: `Set Webhook URL: ${callbackUrl}`,
+      note:  `PayU uses your salt for hash verification. Ensure it matches your dashboard.`,
     },
     phonepe: {
-      where:  'PhonePe Business Dashboard → API Configuration → Redirect URL / Webhook',
-      url:    callbackUrl,
-      note:   'PhonePe calls this URL with base64-encoded response payload.',
+      step1: `Go to: PhonePe Business Dashboard → API Configuration`,
+      step2: `Callback URL: ${callbackUrl}`,
+      note:  `PhonePe sends base64-encoded response. Verification uses your saltKey.`,
     },
     ccavenue: {
-      where:  'CCAvenue Dashboard → Account → My Profile → Notify URL',
-      url:    callbackUrl,
-      note:   'CCAvenue encrypts the response with your Working Key. No separate signature is used.',
+      step1: `Go to: CCAvenue Dashboard → Account → My Profile → Notify URL`,
+      step2: `Notify URL: ${callbackUrl}`,
+      note:  `CCAvenue encrypts the entire response with your Working Key. No separate signature.`,
     },
   };
   return map[gateway] || {};
 }
 
-module.exports = { addMerchant, listMerchants, getMerchant, deactivateMerchant };
+module.exports = {
+  addMerchant,
+  listMerchants,
+  getMerchant,
+  deactivateMerchant,
+  rotateSecret,
+};

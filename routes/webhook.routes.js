@@ -1,17 +1,18 @@
 /**
  * Webhook Routes
  * ──────────────
- * POST /webhook/:gateway/:merchantId
+ * POST /webhook/:gateway/:companySlug/:merchantId
  *
- * :gateway    = razorpay | cashfree | payu | phonepe | ccavenue
- * :merchantId = the MID registered in MerchantConfig
+ * :gateway     = razorpay | cashfree | payu | phonepe | ccavenue
+ * :companySlug = company slug registered on platform  e.g. "acme-ltd"
+ * :merchantId  = gateway's own merchant identifier    e.g. "rzp_live_abc123"
  *
  * Examples:
- *   POST /webhook/razorpay/rzp_live_abc123
- *   POST /webhook/cashfree/CF_APPID_xyz
- *   POST /webhook/payu/QyT13U
- *   POST /webhook/phonepe/MERCHANTID_HERE
- *   POST /webhook/ccavenue/12345678
+ *   POST /webhook/razorpay/acme-ltd/rzp_live_abc123
+ *   POST /webhook/cashfree/acme-ltd/CF_APP_456
+ *   POST /webhook/payu/globemart/QyT13U
+ *   POST /webhook/phonepe/shopnow/SHOPNOW_PROD
+ *   POST /webhook/ccavenue/shopnow/12345678
  */
 
 const express  = require('express');
@@ -21,17 +22,13 @@ const { handleWebhook } = require('../controllers/webhook.controller');
 
 const VALID_GATEWAYS = ['razorpay', 'cashfree', 'payu', 'phonepe', 'ccavenue'];
 
-// Gate: reject unknown gateways before hitting controller
-router.use('/:gateway/:merchantId', (req, res, next) => {
-  const { gateway } = req.params;
-  if (!VALID_GATEWAYS.includes(gateway)) {
-    return res.status(404).json({ error: `Unknown gateway: ${gateway}` });
+router.use('/:gateway/:companySlug/:merchantId', (req, res, next) => {
+  if (!VALID_GATEWAYS.includes(req.params.gateway)) {
+    return res.status(404).json({ error: `Unknown gateway: ${req.params.gateway}` });
   }
   next();
 });
 
-// rawBody middleware — MUST be before any JSON/urlencoded parsing
-// Applied per-route so other routes are unaffected
-router.post('/:gateway/:merchantId', rawBody, handleWebhook);
+router.post('/:gateway/:companySlug/:merchantId', rawBody, handleWebhook);
 
 module.exports = router;

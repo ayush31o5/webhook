@@ -1,218 +1,168 @@
 /**
  * Webhook Controller
  * ──────────────────
- * Single controller handles all 5 gateways.
- * Route: POST /webhook/:gateway/:merchantId
+ * Route: POST /webhook/:gateway/:companySlug/:merchantId
  *
  * Flow:
- *   1. Load MerchantConfig by (gateway + merchantId)
- *   2. Decrypt credentials from DB
+ *   1. Load MerchantConfig by (gateway + companySlug + merchantId)
+ *   2. Decrypt credentials in-memory
  *   3. Verify signature (gateway-specific)
- *   4. Map raw payload → universal keys
- *   5. Store in `webhooks` collection
+ *   4. Map raw payload → normalized Transaction fields
+ *   5. Save Transaction document
  *   6. Return 200 immediately (gateways retry on non-2xx)
  */
 
 const MerchantConfig = require('../models/MerchantConfig');
-const Webhook        = require('../models/Webhook');
+const Transaction    = require('../models/Transaction');
 const { decrypt }    = require('../config/encryption');
 
-// Verifiers
+// ── Verifiers ──────────────────────────────────────────────────────────────
 const { verifyRazorpay }                       = require('../verifiers/razorpay.verifier');
 const { verifyCashfree }                       = require('../verifiers/cashfree.verifier');
 const { verifyPayU }                           = require('../verifiers/payu.verifier');
 const { verifyPhonePe, decodePhonePeResponse } = require('../verifiers/phonepe.verifier');
 const { verifyCCAvenue }                       = require('../verifiers/ccavenue.verifier');
 
-// Mappers
+// ── Mappers ────────────────────────────────────────────────────────────────
 const { mapRazorpay } = require('../mappers/razorpay.mapper');
 const { mapCashfree } = require('../mappers/cashfree.mapper');
 const { mapPayU }     = require('../mappers/payu.mapper');
 const { mapPhonePe }  = require('../mappers/phonepe.mapper');
 const { mapCCAvenue } = require('../mappers/ccavenue.mapper');
 
-// ─── Gateway Handlers ────────────────────────────────────────────────────────
+// ── Per-gateway handlers ───────────────────────────────────────────────────
 
 async function handleRazorpay(req, config) {
-  const creds = config.credentials;
-  const webhookSecret  = decrypt(creds.webhookSecret);
-  const receivedSig    = req.headers['x-razorpay-signature'] || '';
-
-  const isVerified = verifyRazorpay(req.rawBody, receivedSig, webhookSecret);
-  const normalized = mapRazorpay(req.body);
-
-  return {
-    isVerified,
-    receivedSignature: receivedSig,
-    rawPayload: req.body,
-    ...normalized,
-  };
+  const webhookSecret = decrypt(config.credentials.webhookSecret);
+  const receivedSig   = req.headers['x-razorpay-signature'] || '';
+  const isVerified    = verifyRazorpay(req.rawBody, receivedSig, webhookSecret);
+  return { isVerified, receivedSignature: receivedSig, rawPayload: req.body, ...mapRazorpay(req.body) };
 }
 
 async function handleCashfree(req, config) {
-  const creds = config.credentials;
-  const clientSecret = decrypt(creds.clientSecret);
+  const clientSecret = decrypt(config.credentials.clientSecret);
   const receivedSig  = req.headers['x-webhook-signature'] || '';
   const timestamp    = req.headers['x-webhook-timestamp'] || '';
-
-  const isVerified = verifyCashfree(req.rawBody, receivedSig, timestamp, clientSecret);
-  const normalized = mapCashfree(req.body);
-
-  return {
-    isVerified,
-    receivedSignature: receivedSig,
-    rawPayload: req.body,
-    ...normalized,
-  };
+  const isVerified   = verifyCashfree(req.rawBody, receivedSig, timestamp, clientSecret);
+  return { isVerified, receivedSignature: receivedSig, rawPayload: req.body, ...mapCashfree(req.body) };
 }
 
 async function handlePayU(req, config) {
-  const creds = config.credentials;
-  const salt  = decrypt(creds.salt);
-
+  const salt       = decrypt(config.credentials.salt);
   const isVerified = verifyPayU(req.body, salt);
-  const normalized = mapPayU(req.body);
-
-  return {
-    isVerified,
-    receivedSignature: req.body.hash || '',
-    rawPayload: req.body,
-    ...normalized,
-  };
+  return { isVerified, receivedSignature: req.body.hash || '', rawPayload: req.body, ...mapPayU(req.body) };
 }
 
 async function handlePhonePe(req, config) {
-  const creds     = config.credentials;
-  const saltKey   = decrypt(creds.saltKey);
-  const saltIndex = creds.saltIndex || '1';
-
-  const base64Response = req.body.response || '';
-  const xVerify        = req.headers['x-verify'] || '';
-
-  const isVerified = verifyPhonePe(base64Response, xVerify, saltKey, saltIndex);
-
-  // Decode the base64 payload to get actual payment data
-  const decoded    = decodePhonePeResponse(base64Response);
-  const normalized = decoded ? mapPhonePe(decoded) : {};
-
-  return {
-    isVerified,
-    receivedSignature: xVerify,
-    rawPayload: decoded || { base64Response },
-    ...normalized,
-  };
+  const saltKey      = decrypt(config.credentials.saltKey);
+  const saltIndex    = config.credentials.saltIndex || '1';
+  const base64Resp   = req.body.response || '';
+  const xVerify      = req.headers['x-verify'] || '';
+  const isVerified   = verifyPhonePe(base64Resp, xVerify, saltKey, saltIndex);
+  const decoded      = decodePhonePeResponse(base64Resp);
+  return { isVerified, receivedSignature: xVerify, rawPayload: decoded || { base64Response: base64Resp }, ...mapPhonePe(decoded || {}) };
 }
 
 async function handleCCAvenue(req, config) {
-  const creds      = config.credentials;
-  const workingKey = decrypt(creds.workingKey);
-  const encResp    = req.body.encResp || '';
-
-  const { isVerified, decrypted } = verifyCCAvenue(encResp, workingKey, config.merchantId);
-  const normalized = decrypted ? mapCCAvenue(decrypted) : {};
-
-  return {
-    isVerified,
-    receivedSignature: '',   // CCAvenue has no explicit signature header
-    rawPayload: decrypted || { encResp: '[encrypted]' },
-    ...normalized,
-  };
+  const workingKey                    = decrypt(config.credentials.workingKey);
+  const encResp                       = req.body.encResp || '';
+  const { isVerified, decrypted }     = verifyCCAvenue(encResp, workingKey, config.merchantId);
+  return { isVerified, receivedSignature: '', rawPayload: decrypted || { encResp: '[encrypted]' }, ...mapCCAvenue(decrypted || {}) };
 }
 
-// ─── Gateway Router Map ───────────────────────────────────────────────────────
-
-const GATEWAY_HANDLERS = {
+const HANDLERS = {
   razorpay: handleRazorpay,
-  cashfree:  handleCashfree,
-  payu:      handlePayU,
-  phonepe:   handlePhonePe,
-  ccavenue:  handleCCAvenue,
+  cashfree: handleCashfree,
+  payu:     handlePayU,
+  phonepe:  handlePhonePe,
+  ccavenue: handleCCAvenue,
 };
 
-// ─── Main Controller ──────────────────────────────────────────────────────────
+// ── Main controller ────────────────────────────────────────────────────────
 
 const handleWebhook = async (req, res) => {
-  // Always respond 200 first — gateways WILL retry on any other status
-  // We handle failures internally
+  // Always 200 first — gateways retry on any other status
   res.status(200).json({ received: true });
 
-  const { gateway, merchantId } = req.params;
+  const { gateway, companySlug, merchantId } = req.params;
 
-  // ── Step 1: Validate gateway ─────────────────────────────────────────────
-  const handler = GATEWAY_HANDLERS[gateway];
+  // ── 1. Validate gateway ────────────────────────────────────────────────
+  const handler = HANDLERS[gateway];
   if (!handler) {
-    console.warn(`[Webhook] Unknown gateway in route: ${gateway}`);
+    console.warn(`[Webhook] Unknown gateway: ${gateway}`);
     return;
   }
 
-  // ── Step 2: Load MerchantConfig ──────────────────────────────────────────
+  // ── 2. Load MerchantConfig (with credentials) ──────────────────────────
   let config;
   try {
-    config = await MerchantConfig.findOne({
-      gateway,
-      merchantId,
-      isActive: true,
-    }).lean();
+    config = await MerchantConfig
+      .findOne({ gateway, companySlug, merchantId, isActive: true })
+      .select('+credentials')
+      .lean();
   } catch (err) {
-    console.error(`[Webhook] DB error loading config for ${gateway}/${merchantId}:`, err.message);
+    console.error(`[Webhook] DB error | ${gateway}/${companySlug}/${merchantId}:`, err.message);
     return;
   }
 
   if (!config) {
-    console.warn(`[Webhook] No active config for gateway=${gateway} merchantId=${merchantId}`);
-    // Still store the raw webhook for investigation but mark unverified
-    await safeStore({
-      gateway,
-      merchantId,
-      clientId:   'unknown',
-      isVerified: false,
-      rawPayload: req.body,
-      eventType:  'UNKNOWN_MERCHANT',
+    console.warn(`[Webhook] No config | gateway=${gateway} company=${companySlug} mid=${merchantId}`);
+    await saveTransaction({
+      gateway, companySlug, merchantId,
+      companyId:    null,
+      isVerified:   false,
+      eventType:    'UNKNOWN_MERCHANT',
+      status:       'unknown',
+      rawPayload:   req.body,
     });
     return;
   }
 
-  // ── Step 3: Verify + Map ─────────────────────────────────────────────────
+  // ── 3. Verify + Map ────────────────────────────────────────────────────
   let result;
   try {
     result = await handler(req, config);
   } catch (err) {
-    console.error(`[Webhook] Handler error for ${gateway}/${merchantId}:`, err.message);
-    await safeStore({
-      gateway,
-      merchantId,
-      clientId:   config.clientId,
+    console.error(`[Webhook] Handler error | ${gateway}/${companySlug}/${merchantId}:`, err.message);
+    await saveTransaction({
+      gateway, companySlug, merchantId,
+      companyId:  config.companyId,
       isVerified: false,
-      rawPayload: req.body,
       eventType:  'HANDLER_ERROR',
+      status:     'unknown',
+      rawPayload: req.body,
     });
     return;
   }
 
-  // ── Step 4: Log unverified webhooks (don't silently drop them) ───────────
   if (!result.isVerified) {
-    console.warn(`[Webhook] SIGNATURE FAILED | gateway=${gateway} mid=${merchantId} event=${result.eventType}`);
+    console.warn(`[Webhook] Signature FAILED | ${gateway}/${companySlug}/${merchantId} | event=${result.eventType}`);
   }
 
-  // ── Step 5: Store ────────────────────────────────────────────────────────
-  await safeStore({
+  // ── 4. Save Transaction ────────────────────────────────────────────────
+  await saveTransaction({
+    companyId:    config.companyId,
+    companySlug:  config.companySlug,
     gateway,
     merchantId,
-    clientId: config.clientId,
     ...result,
   });
 };
 
-async function safeStore(data) {
+async function saveTransaction(data) {
   try {
-    await Webhook.create(data);
+    const { rawPayload, receivedSignature, ...fields } = data;
+    await Transaction.create({
+      ...fields,
+      rawPayload,  // stored but not returned by default (select:false)
+    });
     console.log(
-      `[Webhook] Stored | gateway=${data.gateway} mid=${data.merchantId} ` +
-      `event=${data.eventType} verified=${data.isVerified} ` +
-      `orderId=${data.orderId} status=${data.status}`
+      `[Transaction] Saved | ${data.gateway}/${data.companySlug}/${data.merchantId}` +
+      ` | event=${data.eventType} verified=${data.isVerified}` +
+      ` | orderId=${data.orderId} status=${data.status} amount=${data.amount}`
     );
   } catch (err) {
-    console.error('[Webhook] Failed to store:', err.message);
+    console.error('[Transaction] Save failed:', err.message);
   }
 }
 

@@ -1,64 +1,71 @@
 /**
  * MerchantConfig
  * ──────────────
- * One document per (company + gateway + merchantId) combination.
+ * One document per (company + gateway + merchantId).
  *
- * Callback URL format:
- *   https://yourplatform.com/webhook/:gateway/:companySlug/:merchantId
+ * Callback URL: /webhook/:gateway/:companySlug/:merchantId
  *
- * Examples:
- *   /webhook/razorpay/acme-ltd/rzp_live_abc123
- *   /webhook/cashfree/acme-ltd/CF_APP_456
- *   /webhook/payu/globemart/QyT13U
+ * ── Credentials stored per gateway (all AES-256-GCM encrypted) ──────────────
  *
- * Per-gateway merchantId:
- *   Razorpay  → Key ID           e.g. rzp_live_abc123
- *   Cashfree  → App ID           e.g. CF_APP_123456
- *   PayU      → Merchant Key     e.g. QyT13U
- *   PhonePe   → Merchant ID      e.g. MERCHANTID_PROD
- *   CCAvenue  → Merchant ID      e.g. 12345678 (numeric)
+ * RAZORPAY
+ *   webhookSecret  → platform-generated, company pastes in dashboard
+ *   keyId          → company's Razorpay Key ID       (rzp_live_xxx)
+ *   keySecret      → company's Razorpay Key Secret   (needed for Documents API + Contest API)
  *
- * Credentials stored (AES-256-GCM encrypted):
- *   Razorpay  → webhookSecret
- *   Cashfree  → clientSecret
- *   PayU      → salt
- *   PhonePe   → saltKey  (saltIndex not encrypted)
- *   CCAvenue  → workingKey, accessCode
+ *   Why keyId + keySecret?
+ *   The webhookSecret is only for HMAC verification of incoming webhooks.
+ *   To UPLOAD evidence files and SUBMIT a dispute contest, you need the API key pair.
+ *   Company provides these from: Razorpay Dashboard → Settings → API Keys
+ *
+ * CASHFREE
+ *   clientId       → Cashfree App ID     (CF_APP_xxx) — also the :merchantId in URL
+ *   clientSecret   → Cashfree API secret (used for webhook HMAC + Disputes API)
+ *
+ * PAYU
+ *   salt           → PayU salt for reverse-hash verification
+ *   (No dispute API — disputes handled via PayU dashboard)
+ *
+ * PHONEPE
+ *   saltKey        → encrypted
+ *   saltIndex      → plain (not secret)
+ *
+ * CCAVENUE
+ *   workingKey     → AES-128 key for encResp decryption
+ *   accessCode     → access code
  */
 
 const mongoose = require('mongoose');
 
 const CredentialSchema = new mongoose.Schema(
   {
-    webhookSecret: { type: String },  // Razorpay
-    clientSecret:  { type: String },  // Cashfree
-    salt:          { type: String },  // PayU
-    saltKey:       { type: String },  // PhonePe (encrypted)
-    saltIndex:     { type: String },  // PhonePe (plain — not secret)
-    workingKey:    { type: String },  // CCAvenue (encrypted)
-    accessCode:    { type: String },  // CCAvenue (encrypted)
+    // Razorpay
+    webhookSecret: { type: String },  // platform-generated (AES encrypted)
+    keyId:         { type: String },  // rzp_live_xxx (AES encrypted)
+    keySecret:     { type: String },  // API key secret (AES encrypted)
+
+    // Cashfree
+    clientId:     { type: String },  // CF_APP_xxx (AES encrypted)
+    clientSecret: { type: String },  // API secret (AES encrypted)
+
+    // PayU
+    salt: { type: String },          // (AES encrypted)
+
+    // PhonePe
+    saltKey:   { type: String },     // (AES encrypted)
+    saltIndex: { type: String },     // plain — not secret
+
+    // CCAvenue
+    workingKey: { type: String },    // (AES encrypted)
+    accessCode: { type: String },    // (AES encrypted)
   },
   { _id: false }
 );
 
 const MerchantConfigSchema = new mongoose.Schema(
   {
-    // ── Ownership ──────────────────────────────────────────────────────
-    companyId: {
-      type:     mongoose.Schema.Types.ObjectId,
-      ref:      'Company',
-      required: true,
-      index:    true,
-    },
+    companyId:   { type: mongoose.Schema.Types.ObjectId, ref: 'Company', required: true, index: true },
+    companySlug: { type: String, required: true, index: true },
 
-    // Denormalized — avoids DB join on every webhook hit
-    companySlug: {
-      type:     String,
-      required: true,
-      index:    true,
-    },
-
-    // ── Gateway ────────────────────────────────────────────────────────
     gateway: {
       type:      String,
       required:  true,
@@ -66,43 +73,22 @@ const MerchantConfigSchema = new mongoose.Schema(
       lowercase: true,
     },
 
-    // Gateway's own identifier for this merchant account (3rd URL segment)
-    merchantId: {
-      type:     String,
-      required: true,
-      trim:     true,
-    },
+    merchantId: { type: String, required: true, trim: true },
+    label:      { type: String, trim: true },
 
-    // Human label e.g. "Razorpay Production Account 1"
-    label: { type: String, trim: true },
-
-    // ── Credentials (all encrypted AES-256-GCM) ───────────────────────
     credentials: {
       type:     CredentialSchema,
       required: true,
-      select:   false,   // never returned in API responses by default
+      select:   false,
     },
 
-    // ── Generated Callback URL ─────────────────────────────────────────
-    // Company pastes this into their gateway dashboard
-    // e.g. https://hooks.yourplatform.com/webhook/razorpay/acme-ltd/rzp_live_abc123
     callbackUrl: { type: String },
-
-    isActive: { type: Boolean, default: true },
+    isActive:    { type: Boolean, default: true },
   },
-  {
-    timestamps:  true,
-    collection:  'merchant_configs',
-  }
+  { timestamps: true, collection: 'merchant_configs' }
 );
 
-// One config per company+gateway+merchantId
-MerchantConfigSchema.index(
-  { companyId: 1, gateway: 1, merchantId: 1 },
-  { unique: true }
-);
-
-// Fast routing lookup on every incoming webhook
+MerchantConfigSchema.index({ companyId: 1, gateway: 1, merchantId: 1 }, { unique: true });
 MerchantConfigSchema.index({ gateway: 1, companySlug: 1, merchantId: 1 });
 
 module.exports = mongoose.model('MerchantConfig', MerchantConfigSchema);

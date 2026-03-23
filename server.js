@@ -11,8 +11,7 @@ const express       = require('express');
 const connectDB     = require('./config/db');
 const webhookRoutes = require('./routes/webhook.routes');
 const apiRoutes     = require('./routes/api.routes');
-console.log("ENCRYPTION_KEY:", process.env.ENCRYPTION_KEY);
-console.log("Length:", process.env.ENCRYPTION_KEY?.length);
+
 const app  = express();
 const PORT = process.env.PORT || 4000;
 
@@ -54,5 +53,7 @@ app.use((err, req, res, next) => {
     console.log(`  POST   ${base}/webhook/:gateway/:companySlug/:merchantId`);
     console.log(`  e.g.   ${base}/webhook/razorpay/acme-ltd/rzp_live_abc123`);
     console.log(`  e.g.   ${base}/webhook/cashfree/acme-ltd/CF_APP_456\n`);
+    console.log("ENCRYPTION_KEY:", process.env.ENCRYPTION_KEY);
+    console.log("Length:", process.env.ENCRYPTION_KEY?.length);
   });
 })();

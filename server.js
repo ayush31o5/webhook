@@ -11,7 +11,8 @@ const express       = require('express');
 const connectDB     = require('./config/db');
 const webhookRoutes = require('./routes/webhook.routes');
 const apiRoutes     = require('./routes/api.routes');
-
+console.log("ENCRYPTION_KEY:", process.env.ENCRYPTION_KEY);
+console.log("Length:", process.env.ENCRYPTION_KEY?.length);
 const app  = express();
 const PORT = process.env.PORT || 4000;
 

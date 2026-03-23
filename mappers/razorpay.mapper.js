@@ -1,76 +1,103 @@
 /**
- * CCAvenue Webhook Verifier / Decryptor
- * ──────────────────────────────────────
- * CCAvenue does NOT use HMAC. Instead, the entire response body
- * is AES-128-CBC encrypted using the Working Key.
+ * Razorpay → Transaction Mapper
  *
- * The body arrives as: { encResp: "<hex-encoded-ciphertext>" }
+ * Razorpay webhook events and their payload structure:
  *
- * Decryption steps (per official CCAvenue docs):
- *   1. key  = MD5( workingKey )              → 16 bytes
- *   2. iv   = 0x000102030405060708090a0b0c0d0e0f   → 16 bytes
- *   3. AES-128-CBC decrypt the hex-encoded ciphertext
- *   4. Parse the resulting query-string format into an object
+ * payment.captured / payment.failed / payment.authorized
+ *   payload.payment.entity → full payment object
  *
- * Verification: If decryption succeeds and merchant_id in the
- * decrypted payload matches the configured MerchantConfig.merchantId,
- * we consider it verified (CCAvenue has no separate signature).
+ * refund.created / refund.processed
+ *   payload.refund.entity  → refund object
+ *   payload.payment.entity → original payment
  *
- * Docs: https://www.ccavenue.com/download/integration-kit.jsp
+ * order.paid
+ *   payload.order.entity   → order object
+ *   payload.payment.entity → payment object
+ *
+ * payment.dispute.created / payment.dispute.won / payment.dispute.lost
+ *   payload.dispute.entity → dispute object
+ *   payload.payment.entity → payment object
  */
 
-const crypto = require('crypto');
+const STATUS_MAP = {
+  captured:   'success',
+  authorized: 'pending',
+  failed:     'failed',
+  refunded:   'refund',
+  created:    'pending',
+};
 
-const IV = Buffer.from([
-  0x00, 0x01, 0x02, 0x03,
-  0x04, 0x05, 0x06, 0x07,
-  0x08, 0x09, 0x0a, 0x0b,
-  0x0c, 0x0d, 0x0e, 0x0f,
-]);
+const METHOD_MAP = {
+  card:       'card',
+  upi:        'upi',
+  netbanking: 'netbanking',
+  wallet:     'wallet',
+  emi:        'emi',
+};
 
-/**
- * Decrypt CCAvenue's encResp field.
- *
- * @param {string} encResp      - hex-encoded ciphertext from CCAvenue
- * @param {string} workingKey   - decrypted workingKey from MerchantConfig (plaintext)
- * @returns {object|null}       - parsed response fields, or null on failure
- */
-function decryptCCAvenue(encResp, workingKey) {
-  if (!encResp || !workingKey) return null;
+function mapRazorpay(body) {
+  const event    = body.event || '';
+  const payment  = body?.payload?.payment?.entity || {};
+  const refund   = body?.payload?.refund?.entity  || null;
+  const dispute  = body?.payload?.dispute?.entity || null;
 
-  try {
-    const key = crypto.createHash('md5').update(workingKey).digest();    // 16-byte key
-    const decipher = crypto.createDecipheriv('aes-128-cbc', key, IV);
-    decipher.setAutoPadding(true);
+  let rawStatus = payment.status;
+  if (refund)  rawStatus = 'refunded';
+  if (dispute) rawStatus = 'disputed';
+  // event-level override for clarity
+  if (event === 'payment.failed') rawStatus = 'failed';
 
-    let decrypted  = decipher.update(encResp, 'hex', 'utf8');
-    decrypted     += decipher.final('utf8');
+  const method = METHOD_MAP[payment.method] || 'other';
 
-    // CCAvenue returns a query-string encoded response
-    // e.g. "order_id=123&tracking_id=456&order_status=Success&..."
-    const parsed = Object.fromEntries(new URLSearchParams(decrypted));
-    return parsed;
-  } catch (err) {
-    console.error('[CCAvenue] Decryption failed:', err.message);
-    return null;
+  // ── Method-specific details ─────────────────────────────────────
+  const upi = {};
+  const card = {};
+  const netbanking = {};
+  const wallet = {};
+
+  if (method === 'upi') {
+    upi.vpa = payment.vpa || null;
+    // UTR comes from acquirer_data
+    upi.utr = payment.acquirer_data?.upi_transaction_id || null;
   }
+
+  if (method === 'card' || method === 'emi') {
+    const c = payment.card || {};
+    card.network = c.network || null;   // Visa, Mastercard, RuPay, Amex
+    card.last4   = c.last4   || null;
+    card.type    = c.type    || null;   // credit / debit
+    card.bank    = c.issuer  || null;
+  }
+
+  if (method === 'netbanking') {
+    netbanking.bank     = payment.bank      || null;
+    netbanking.bankCode = payment.bank_code || null;
+  }
+
+  if (method === 'wallet') {
+    wallet.name = payment.wallet || null;
+  }
+
+  return {
+    eventType:     event,
+    orderId:       payment.order_id || body?.payload?.order?.entity?.id || null,
+    paymentId:     refund ? refund.id  : (payment.id  || null),
+    bankRefNumber: payment.acquirer_data?.bank_transaction_id || null,
+    amount:        payment.amount    || null,   // already in paise
+    currency:      payment.currency  || 'INR',
+    status:        STATUS_MAP[rawStatus] || (dispute ? 'disputed' : 'unknown'),
+    method,
+    upi,
+    card,
+    netbanking,
+    wallet,
+    failureReason: payment.error_description || payment.error_reason || null,
+    customer: {
+      email: payment.email   || null,
+      phone: payment.contact || null,
+      name:  null,    // Razorpay doesn't send name in webhook
+    },
+  };
 }
 
-/**
- * "Verify" CCAvenue: decrypt + check that merchant_id matches our config.
- *
- * @param {string} encResp
- * @param {string} workingKey
- * @param {string} expectedMerchantId   - MerchantConfig.merchantId
- * @returns {{ isVerified: boolean, decrypted: object|null }}
- */
-function verifyCCAvenue(encResp, workingKey, expectedMerchantId) {
-  const decrypted = decryptCCAvenue(encResp, workingKey);
-  if (!decrypted) return { isVerified: false, decrypted: null };
-
-  // CCAvenue includes merchant_id in the decrypted payload
-  const isVerified = decrypted.merchant_id === String(expectedMerchantId);
-  return { isVerified, decrypted };
-}
-
-module.exports = { verifyCCAvenue, decryptCCAvenue };
+module.exports = { mapRazorpay };

@@ -1,0 +1,288 @@
+openapi: 3.0.0
+info:
+  title: Webhook API
+  version: 1.0.0
+  description: API for managing companies, merchants, transactions, disputes and webhooks
+
+servers:
+  - url: https://webhook-8hqp.onrender.com
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+
+paths:
+
+  /health:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: API is running
+
+  /api/companies:
+    post:
+      summary: Register company
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email]
+              properties:
+                name:
+                  type: string
+                email:
+                  type: string
+      responses:
+        "200":
+          description: Company created
+
+  /api/companies/me:
+    get:
+      summary: Get company info
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Company details
+
+  /api/companies/rotate-key:
+    post:
+      summary: Rotate API key
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: New API key generated
+
+  /api/merchants:
+    post:
+      summary: Add merchant
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                gateway:
+                  type: string
+                  enum: [razorpay, cashfree, payu, phonepe, ccavenue]
+                merchantId:
+                  type: string
+                label:
+                  type: string
+                credentials:
+                  type: object
+      responses:
+        "200":
+          description: Merchant added
+
+    get:
+      summary: List merchants
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: gateway
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: List of merchants
+
+  /api/merchants/{id}:
+    get:
+      summary: Get merchant
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Merchant details
+
+    delete:
+      summary: Deactivate merchant
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+      responses:
+        "200":
+          description: Merchant deleted
+
+  /api/merchants/{id}/rotate-secret:
+    post:
+      summary: Rotate webhook secret
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+      responses:
+        "200":
+          description: Secret rotated
+
+  /api/transactions:
+    get:
+      summary: List transactions
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: gateway
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Transactions list
+
+  /api/transactions/{id}:
+    get:
+      summary: Get single transaction
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+      responses:
+        "200":
+          description: Transaction details
+
+  /api/transactions/order/{orderId}:
+    get:
+      summary: Get by order ID
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+      responses:
+        "200":
+          description: Transaction
+
+  /api/disputes:
+    get:
+      summary: List disputes
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Disputes list
+
+  /api/disputes/{id}:
+    get:
+      summary: Get dispute
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+      responses:
+        "200":
+          description: Dispute details
+
+  /api/disputes/urgent:
+    get:
+      summary: Urgent disputes
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Urgent disputes
+
+  /api/disputes/{id}/evidence/upload:
+    post:
+      summary: Upload evidence
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                evidenceType:
+                  type: string
+                note:
+                  type: string
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "200":
+          description: Uploaded
+
+  /api/disputes/{id}/evidence:
+    get:
+      summary: List evidence
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Evidence list
+
+  /api/disputes/{id}/evidence/summary:
+    get:
+      summary: Evidence summary
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Summary
+
+  /api/disputes/{id}/evidence/submit:
+    post:
+      summary: Submit evidence
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                summary:
+                  type: string
+                action:
+                  type: string
+      responses:
+        "200":
+          description: Submitted
+
+  /api/disputes/{id}/evidence/{evidenceId}:
+    delete:
+      summary: Delete evidence
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+        - name: evidenceId
+          in: path
+          required: true
+      responses:
+        "200":
+          description: Deleted
